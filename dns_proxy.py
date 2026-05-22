@@ -33,17 +33,23 @@ def parse_filter_token(value: str) -> bytes:
 
     Accepted forms:
     - decimal integer: 123456
-    - hex integer: 0x1e240
-    - DoH URL: https://123456.doh.skydns.ru
+    - hex integer with prefix: 0x1e240
+    - DoH URL with hex token: https://abcdef12.doh.skydns.ru
+    - DoH URL with decimal-only token: https://123456.doh.skydns.ru
     """
     token_text = value.strip()
 
-    url_match = re.fullmatch(r"https?://([0-9A-Fa-f]+)\.doh\.skydns\.ru", token_text, re.ASCII)
-    if url_match:
-        token_text = url_match.group(1)
+    url_match = re.fullmatch(
+        r"https?://([0-9A-Fa-f]+)\.doh\.skydns\.ru/?",
+        token_text,
+        re.ASCII,
+    )
 
     try:
-        token_int = int(token_text, 0)
+        if url_match:
+            token_int = int(url_match.group(1), 16)
+        else:
+            token_int = int(token_text, 0)
     except ValueError as exc:
         raise argparse.ArgumentTypeError(
             "token must be a decimal/hex integer or a URL like https://<token>.doh.skydns.ru"
@@ -56,31 +62,47 @@ def parse_filter_token(value: str) -> bytes:
 
 
 def add_filter_token_option(packet: bytes, token: bytes) -> bytes:
-    """Add EDNS0 option 65520 with the filtering token to the DNS query."""
+    """Add EDNS0 option 65520 with the filtering token to the DNS query.
+
+    If the client already sent an OPT record, preserve its UDP payload size and
+    EDNS flags/version while appending the custom option. This avoids changing
+    client-requested EDNS behavior such as DNSSEC DO bit.
+    """
     request = DNSRecord.parse(packet)
     option = EDNSOption(FILTER_TOKEN_OPTION_CODE, token)
 
     existing_options = []
+    udp_len = DEFAULT_UDP_PAYLOAD_SIZE
+    ttl = 0
 
     for additional_record in list(request.ar):
-        if additional_record.rtype == QTYPE.OPT:
-            existing_options.extend(additional_record.rdata)
-            request.ar.remove(additional_record)
+        if additional_record.rtype != QTYPE.OPT:
+            continue
 
+        udp_len = getattr(additional_record, "rclass", udp_len)
+        ttl = getattr(additional_record, "ttl", ttl)
+        existing_options.extend(additional_record.rdata)
+        request.ar.remove(additional_record)
+
+    existing_options = [
+        existing_option
+        for existing_option in existing_options
+        if getattr(existing_option, "code", None) != FILTER_TOKEN_OPTION_CODE
+    ]
     existing_options.append(option)
 
-    request.add_ar(
-        EDNS0(
-            udp_len=DEFAULT_UDP_PAYLOAD_SIZE,
-            opts=existing_options,
-        )
+    opt_record = EDNS0(
+        udp_len=udp_len,
+        opts=existing_options,
     )
+    opt_record.ttl = ttl
+    request.add_ar(opt_record)
 
     return request.pack()
 
 
 def iter_response_categories(packet: bytes) -> Iterable[list[int]]:
-    """Yield category lists from EDNS0 option 65000 in the DNS response."""
+    """Yield valid 8-byte category lists from EDNS0 option 65000 in the response."""
     response = DNSRecord.parse(packet)
 
     for additional_record in response.ar:
@@ -88,8 +110,15 @@ def iter_response_categories(packet: bytes) -> Iterable[list[int]]:
             continue
 
         for option in additional_record.rdata:
-            if getattr(option, "code", None) == CATEGORIES_OPTION_CODE:
-                yield list(bytes(option.data))
+            if getattr(option, "code", None) != CATEGORIES_OPTION_CODE:
+                continue
+
+            data = bytes(option.data)
+            if len(data) != 8:
+                logging.warning("Invalid categories length: %d, raw=%r", len(data), data)
+                continue
+
+            yield list(data)
 
 
 class DNSProxyHandler(socketserver.BaseRequestHandler):
