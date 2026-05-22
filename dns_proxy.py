@@ -9,8 +9,9 @@ upstream response to the client unchanged.
 
 from __future__ import annotations
 
+import argparse
 import logging
-import os
+import re
 import socket
 import socketserver
 from typing import Iterable
@@ -19,27 +20,37 @@ from dnslib import DNSRecord, EDNS0, EDNSOption, QTYPE
 
 LISTEN_HOST = "127.0.0.1"
 LISTEN_PORT = 5353
-
 UPSTREAM_HOST = "193.58.251.251"
 UPSTREAM_PORT = 53
-
-UPSTREAM_TIMEOUT = 3.0
 
 FILTER_TOKEN_OPTION_CODE = 0xFFF0  # 65520
 CATEGORIES_OPTION_CODE = 65000
 DEFAULT_UDP_PAYLOAD_SIZE = 1232
 
 
-def read_filter_token_from_env() -> bytes:
-    token_text = os.environ.get("SKYDNS_TOKEN")
+def parse_filter_token(value: str) -> bytes:
+    """Convert token from CLI to a 4-byte big-endian sequence.
 
-    if not token_text:
-        raise RuntimeError("SKYDNS_TOKEN environment variable is required")
+    Accepted forms:
+    - decimal integer: 123456
+    - hex integer: 0x1e240
+    - DoH URL: https://123456.doh.skydns.ru
+    """
+    token_text = value.strip()
 
-    token_int = int(token_text, 0)
+    url_match = re.search(r"https?://([^./]+)\.doh\.skydns\.ru", token_text)
+    if url_match:
+        token_text = url_match.group(1)
+
+    try:
+        token_int = int(token_text, 0)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "token must be a decimal/hex integer or a URL like https://<token>.doh.skydns.ru"
+        ) from exc
 
     if not 0 <= token_int <= 0xFFFFFFFF:
-        raise RuntimeError("SKYDNS_TOKEN must fit into 4 bytes: 0..4294967295")
+        raise argparse.ArgumentTypeError("token must fit into 4 bytes: 0..4294967295")
 
     return token_int.to_bytes(4, byteorder="big", signed=False)
 
@@ -49,17 +60,21 @@ def add_filter_token_option(packet: bytes, token: bytes) -> bytes:
     request = DNSRecord.parse(packet)
     option = EDNSOption(FILTER_TOKEN_OPTION_CODE, token)
 
-    for additional_record in request.ar:
+    existing_options = []
+
+    for additional_record in list(request.ar):
         if additional_record.rtype == QTYPE.OPT:
-            additional_record.rdata.append(option)
-            break
-    else:
-        request.add_ar(
-            EDNS0(
-                udp_len=DEFAULT_UDP_PAYLOAD_SIZE,
-                opts=[option],
-            )
+            existing_options.extend(additional_record.rdata)
+            request.ar.remove(additional_record)
+
+    existing_options.append(option)
+
+    request.add_ar(
+        EDNS0(
+            udp_len=DEFAULT_UDP_PAYLOAD_SIZE,
+            opts=existing_options,
         )
+    )
 
     return request.pack()
 
@@ -78,9 +93,18 @@ def iter_response_categories(packet: bytes) -> Iterable[list[int]]:
 
 
 class DNSProxyHandler(socketserver.BaseRequestHandler):
+    """UDP request handler; server attributes are set in main()."""
+
     def handle(self) -> None:
         client_packet, client_socket = self.request
         client_ip, client_port = self.client_address
+
+        logging.info(
+            "Received %d bytes from %s:%s",
+            len(client_packet),
+            client_ip,
+            client_port,
+        )
 
         try:
             proxied_packet = add_filter_token_option(client_packet, self.server.filter_token)
@@ -90,8 +114,8 @@ class DNSProxyHandler(socketserver.BaseRequestHandler):
 
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as upstream_socket:
-                upstream_socket.settimeout(UPSTREAM_TIMEOUT)
-                upstream_socket.sendto(proxied_packet, (UPSTREAM_HOST, UPSTREAM_PORT))
+                upstream_socket.settimeout(self.server.timeout)
+                upstream_socket.sendto(proxied_packet, self.server.upstream)
                 response_packet, _ = upstream_socket.recvfrom(4096)
         except socket.timeout:
             logging.warning("Upstream DNS timeout for client %s:%s", client_ip, client_port)
@@ -102,7 +126,6 @@ class DNSProxyHandler(socketserver.BaseRequestHandler):
 
         try:
             found_categories = False
-
             for categories in iter_response_categories(response_packet):
                 found_categories = True
                 logging.info("Categories: %s", categories)
@@ -120,20 +143,41 @@ class ThreadingUDPServer(socketserver.ThreadingMixIn, socketserver.UDPServer):
     allow_reuse_address = True
 
 
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="SkyDNS DNS proxy with custom EDNS0 options")
+    parser.add_argument(
+        "--token",
+        required=True,
+        type=parse_filter_token,
+        help="filtering token: decimal/hex integer or https://<token>.doh.skydns.ru",
+    )
+    parser.add_argument("--listen-host", default=LISTEN_HOST)
+    parser.add_argument("--listen-port", type=int, default=LISTEN_PORT)
+    parser.add_argument("--upstream-host", default=UPSTREAM_HOST)
+    parser.add_argument("--upstream-port", type=int, default=UPSTREAM_PORT)
+    parser.add_argument("--timeout", type=float, default=3.0)
+    parser.add_argument("--debug", action="store_true")
+    return parser
+
+
 def main() -> None:
+    args = build_arg_parser().parse_args()
+
     logging.basicConfig(
-        level=logging.INFO,
+        level=logging.DEBUG if args.debug else logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
     )
 
-    filter_token = read_filter_token_from_env()
-    server_address = (LISTEN_HOST, LISTEN_PORT)
+    server_address = (args.listen_host, args.listen_port)
+    upstream_address = (args.upstream_host, args.upstream_port)
 
     with ThreadingUDPServer(server_address, DNSProxyHandler) as server:
-        server.filter_token = filter_token
+        server.filter_token = args.token
+        server.upstream = upstream_address
+        server.timeout = args.timeout
 
         logging.info("Listening on %s:%s", *server_address)
-        logging.info("Forwarding DNS queries to %s:%s", UPSTREAM_HOST, UPSTREAM_PORT)
+        logging.info("Forwarding DNS queries to %s:%s", *upstream_address)
         server.serve_forever()
 
 
