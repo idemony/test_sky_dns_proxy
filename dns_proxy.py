@@ -38,7 +38,7 @@ def parse_filter_token(value: str) -> bytes:
     """
     token_text = value.strip()
 
-    url_match = re.search(r"https?://([^./]+)\.doh\.skydns\.ru", token_text)
+    url_match = re.fullmatch(r"https?://([0-9A-Fa-f]+)\.doh\.skydns\.ru", token_text, re.ASCII)
     if url_match:
         token_text = url_match.group(1)
 
@@ -99,6 +99,10 @@ class DNSProxyHandler(socketserver.BaseRequestHandler):
         client_packet, client_socket = self.request
         client_ip, client_port = self.client_address
 
+        if len(client_packet) > 4096:
+            logging.warning("Client packet too large: %d", len(client_packet))
+            return
+
         logging.info(
             "Received %d bytes from %s:%s",
             len(client_packet),
@@ -116,7 +120,7 @@ class DNSProxyHandler(socketserver.BaseRequestHandler):
             with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as upstream_socket:
                 upstream_socket.settimeout(self.server.timeout)
                 upstream_socket.sendto(proxied_packet, self.server.upstream)
-                response_packet, _ = upstream_socket.recvfrom(4096)
+                response_packet, _ = upstream_socket.recvfrom(65535)
         except socket.timeout:
             logging.warning("Upstream DNS timeout for client %s:%s", client_ip, client_port)
             return
